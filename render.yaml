@@ -1,0 +1,24 @@
+# Render Blueprint for mcp-cloudflare
+services:
+  - type: web
+    name: mcp-cloudflare
+    runtime: node
+    plan: starter
+    region: oregon
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: CLOUDFLARE_API_TOKEN
+        sync: false
+      - key: CLOUDFLARE_ACCOUNT_ID
+        sync: false
+      - key: CLOUDFLARE_ZONE_ID
+        sync: false
+      - key: CLOUDFLARE_CLIENT_ID
+        sync: false
+      - key: CLOUDFLARE_CLIENT_SECRET
+        sync: false
+      - key: MCP_AUTH_TOKEN
+        sync: false
