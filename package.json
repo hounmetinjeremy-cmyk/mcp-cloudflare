@@ -1,29 +1,25 @@
 {
-  "name": "mcp-cloudflare",
-  "version": "0.2.0",
-  "description": "MCP server exposing the entire Cloudflare API ecosystem",
+  "name": "cloudflare-mcp-server",
+  "version": "1.0.0",
+  "description": "Serveur MCP TypeScript/Node.js : pilotage 100% autonome de l'écosystème Cloudflare (Workers, DNS, routes, KV, logs temps réel).",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc && echo '/* global BROWSER_ENV */' > dist/browser-env.js",
+    "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts"
+    "dev": "tsc --watch"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
     "express": "^4.21.2",
-    "ws": "^8.18.0",
-    "zod": "^3.24.0"
+    "zod": "^3.24.2"
   },
   "devDependencies": {
+    "typescript": "^5.7.3",
     "@types/express": "^4.17.21",
-    "@types/node": "^20.14.0",
-    "@types/ws": "^8.5.10",
-    "tsx": "^4.19.0",
-    "typescript": "^5.5.0"
-  },
-  "engines": {
-    "node": ">=20.0.0"
-  },
-  "license": "MIT"
+    "@types/node": "^22.10.7"
+  }
 }

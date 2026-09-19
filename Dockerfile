@@ -1,16 +1,15 @@
-FROM node:20-slim AS build
+FROM node:20-slim
+
 WORKDIR /app
+
 COPY package.json package-lock.json* ./
-RUN npm install --include=dev
+RUN npm install
+
 COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build && npm prune --omit=dev
 
-FROM node:20-slim
-WORKDIR /app
-COPY --from=build /app/package.json ./
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
-ENV PORT=10000
-EXPOSE 10000
+ENV NODE_ENV=production
+EXPOSE 3000
+
 CMD ["node", "dist/index.js"]
