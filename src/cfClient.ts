@@ -1,22 +1,15 @@
 /**
- * Cloudflare API client for the MCP server.
+ * cfClient.ts — Bibliothèque cliente Cloudflare réutilisable.
  *
- * Implements the tools:
- *   cf-api, deploy_worker, list_workers, delete_worker,
- *   set_worker_secret, configure_route, tail_worker_logs
+ * Ce module N'EST PAS câblé dans index.ts : il sert de bibliothèque pour
+ * étendre le serveur (comptes, zones, DNS, KV, R2...) sans dupliquer le client.
+ * Les outils actifs du serveur MCP sont ceux de src/tools/*.
  *
- * Authentication is transparent: credentials are read from environment
- * variables (or ~/.cloudflare/config.json) once at startup and injected
- * automatically into every request.
+ * Différences vs la 1re version (corrigées) :
+ *  - imports explicites (McpError + ErrorCode), plus de dépendance `ws`
+ *    (WebSocket natif de Node 22), typage propre (plus d'erreurs TS).
  */
-import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { McpError } from "@modelcontextprotocol/sdk/types.js";
-import WebSocket from "ws";
-
-/* ------------------------------------------------------------------ */
-/* Constants & shared helpers                                          */
-/* ------------------------------------------------------------------ */
+import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 
 const CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4";
 
@@ -28,88 +21,53 @@ function getCredentials() {
   return { apiToken, accountId, zoneId };
 }
 
-function authHeaders(apiToken: string): Record<string, string> {
-  return {
-    Authorization: `Bearer ${apiToken}`,
-    "Content-Type": "application/json",
-  };
+function authHeaders(
+  apiToken: string,
+  contentType?: string,
+): Record<string, string> {
+  const h: Record<string, string> = { Authorization: `Bearer ${apiToken}` };
+  if (contentType) h["Content-Type"] = contentType;
+  return h;
 }
 
 function truncate(text: string, maxLength = 8000): string {
   return text.length > maxLength ? text.slice(0, maxLength) : text;
 }
 
-interface CFResponse<T = unknown> {
+interface CFResponse<T = any> {
   success: boolean;
-  errors?: unknown[];
-  messages?: unknown[];
+  errors?: any[];
+  messages?: any[];
   result?: T;
-  result_info?: unknown;
+  result_info?: any;
 }
-
-/* ------------------------------------------------------------------ */
-/* Account resolution                                                  */
-/* ------------------------------------------------------------------ */
-
-let cachedAccountId: string | null = null;
-
-async function resolveAccountId(apiToken: string): Promise<string> {
-  const explicit = process.env.CLOUDFLARE_ACCOUNT_ID;
-  if (explicit) return explicit;
-  if (cachedAccountId) return cachedAccountId;
-
-  const res = await fetch(`${CLOUDFLARE_API_BASE}/accounts`, {
-    headers: authHeaders(apiToken),
-  });
-  const data = (await res.json()) as CFResponse<{ id: string; name: string }[]>;
-  if (!data.success || !data.result || data.result.length === 0) {
-    throw new McpError(
-      ErrorCode.InvalidRequest,
-      `Failed to resolve Cloudflare account ID: ${truncate(JSON.stringify(data.errors ?? data), 500)}`
-    );
-  }
-  if (data.result.length > 1) {
-    console.error(
-      "[mcp-cloudflare] Multiple Cloudflare accounts found. Using the first one. " +
-        "Set CLOUDFLARE_ACCOUNT_ID to select a specific account. " +
-        `Accounts: ${data.result.map((a) => `${a.name} (${a.id})`).join(", ")}`
-    );
-  }
-  cachedAccountId = data.result[0].id;
-  return cachedAccountId;
-}
-
-/* ------------------------------------------------------------------ */
-/* Tool implementations                                                */
-/* ------------------------------------------------------------------ */
 
 async function httpCall(
   apiToken: string,
   method: string,
   path: string,
   body?: unknown,
-  query?: Record<string, string>,
-  headers?: Record<string, string>,
+  extraHeaders?: Record<string, string>,
 ): Promise<CFResponse> {
-  const url = new URL(`${CLOUDFLARE_API_BASE}${path}`);
-  if (query) {
-    for (const [key, value] of Object.entries(query)) {
-      url.searchParams.set(key, String(value));
+  const url = `${CLOUDFLARE_API_BASE}${path}`;
+  const init: RequestInit = {
+    method,
+    headers: { ...authHeaders(apiToken), ...(extraHeaders ?? {}) },
+  };
+
+  if (body !== undefined) {
+    if (typeof body === "string" || body instanceof FormData || body instanceof Blob) {
+      (init as any).body = body; // corps brut ou multipart (boundary géré par undici)
+    } else {
+      init.body = JSON.stringify(body);
+      if (!extraHeaders?.["Content-Type"]) {
+        (init.headers as Record<string, string>)["Content-Type"] = "application/json";
+      }
     }
   }
 
-  const headers: Record<string, string> = {
-    ...authHeaders(apiToken),
-    ...extraHeaders,
-  };
-
-  const init: RequestInit = { method, headers };
-  if (body !== undefined) {
-    init.body = JSON.stringify(body);
-  }
-
-  const response = await fetch(url.toString(), init);
-  let payload: unknown;
+  const response = await fetch(url, init);
+  let payload: any;
   try {
     payload = await response.json();
   } catch {
@@ -119,43 +77,65 @@ async function httpCall(
   if (!response.ok) {
     throw new McpError(
       ErrorCode.InternalError,
-      `Cloudflare API request failed with status ${response.status}: ${truncate(JSON.stringify(payload), 1000)}`
+      `Cloudflare API request failed with status ${response.status}: ${truncate(
+        JSON.stringify(payload),
+        1000,
+      )}`,
     );
   }
   return payload as CFResponse;
 }
 
-interface DeployWorkerInput {
+/* ------------------------------------------------------------------ */
+/* Résolution du compte                                                */
+/* ------------------------------------------------------------------ */
+
+let cachedAccountId: string | null = null;
+
+export async function resolveAccountId(apiToken: string): Promise<string> {
+  const explicit = process.env.CLOUDFLARE_ACCOUNT_ID;
+  if (explicit) return explicit;
+  if (cachedAccountId) return cachedAccountId;
+
+  const res = await httpCall(apiToken, "GET", "/accounts");
+  const accounts = (res.result ?? []) as Array<{ id: string; name: string }>;
+  if (!Array.isArray(accounts) || accounts.length === 0) {
+    throw new McpError(
+      ErrorCode.InvalidRequest,
+      `Failed to resolve Cloudflare account ID: ${truncate(
+        JSON.stringify(res.errors ?? res),
+        500,
+      )}`,
+    );
+  }
+  if (accounts.length > 1) {
+    console.error(
+      "[mcp-cloudflare] Multiple Cloudflare accounts found. Using the first one. " +
+        "Set CLOUDFLARE_ACCOUNT_ID to select a specific account. " +
+        `Accounts: ${accounts.map((a) => `${a.name} (${a.id})`).join(", ")}`,
+    );
+  }
+  cachedAccountId = accounts[0].id;
+  return cachedAccountId;
+}
+
+/* ------------------------------------------------------------------ */
+/* Déploiement de Workers (mono ou multi-modules ES)                   */
+/* ------------------------------------------------------------------ */
+
+export interface DeployWorkerInput {
   name: string;
   main_module?: string;
   script?: string;
   modules?: Record<string, string>;
-  bindings?: Array<{
-    type: string;
-    name: string;
-    namespace_id?: string;
-    bucket_name?: string;
-    id?: string;
-    text?: string;
-    json?: string;
-    class_name?: string;
-    script_name?: string;
-    service?: string;
-    environment?: string;
-    queue_name?: string;
-    [key: string]: unknown;
-  }>;
+  bindings?: Array<Record<string, unknown>>;
   compatibility_date?: string;
   compatibility_flags?: string[];
   migrations?: Record<string, unknown>;
   keep_bindings?: string[];
 }
 
-/**
- * Deploy a Cloudflare Worker script or module.
- * Tries ESM module upload first; falls back to plain script upload.
- */
-export async function deployWorker(input: DeployWorkerInput) {
+export async function deployWorker(input: DeployWorkerInput): Promise<string> {
   const { apiToken, accountId } = getCredentials();
   const form = new FormData();
 
@@ -170,10 +150,11 @@ export async function deployWorker(input: DeployWorkerInput) {
             compatibility_date: input.compatibility_date,
             compatibility_flags: input.compatibility_flags ?? [],
             migrations: input.migrations,
+            keep_bindings: input.keep_bindings,
           }),
         ],
-        { type: "application/json" }
-      )
+        { type: "application/json" },
+      ),
     );
     for (const [moduleName, content] of Object.entries(input.modules ?? {})) {
       const contentType = moduleName.endsWith(".js")
@@ -188,92 +169,100 @@ export async function deployWorker(input: DeployWorkerInput) {
       form.append(moduleName, new Blob([content], { type: contentType }), moduleName);
     }
   } else {
-    form.append("metadata", new Blob([JSON.stringify({ bindings: input.bindings ?? [], compatibility_date: input.compatibility_date, compatibility_flags: input.compatibility_flags ?? [], migrations: input.migrations })], { type: "application/json" }));
-    form.append("script", new Blob([input.script], { type: "application/javascript" }), "script");
+    form.append(
+      "metadata",
+      new Blob(
+        [
+          JSON.stringify({
+            bindings: input.bindings ?? [],
+            compatibility_date: input.compatibility_date,
+            compatibility_flags: input.compatibility_flags ?? [],
+            migrations: input.migrations,
+          }),
+        ],
+        { type: "application/json" },
+      ),
+    );
+    form.append(
+      "script",
+      new Blob([input.script ?? ""], { type: "application/javascript" }),
+      "script",
+    );
   }
 
-  const res = await httpCall(
-    apiToken,
-    "PUT",
-    `/accounts/${accountId}/workers/scripts`,
-    form
+  const res = await fetch(
+    `${CLOUDFLARE_API_BASE}/accounts/${accountId}/workers/scripts/${encodeURIComponent(input.name)}`,
+    { method: "PUT", headers: authHeaders(apiToken), body: form },
   );
-  return JSON.stringify({
-    success: res.ok,
-    result: res.result,
-    errors: res.errors,
-  });
+  const payload: any = await res.json().catch(() => null);
+  return JSON.stringify({ ok: res.ok, status: res.status, body: payload }, null, 2);
 }
 
-interface ListWorkersInput {
-  [key: string]: unknown;
-}
+/* ------------------------------------------------------------------ */
+/* Outils Workers                                                      */
+/* ------------------------------------------------------------------ */
 
-async function listWorkers(apiToken: string, accountId: string) {
+export async function listWorkers(): Promise<string> {
+  const { apiToken, accountId } = getCredentials();
   const scripts = await httpCall(
     apiToken,
     "GET",
-    `/accounts/${accountId}/workers/scripts`
+    `/accounts/${accountId}/workers/scripts`,
   );
-  return scripts;
+  return JSON.stringify(scripts, null, 2);
 }
 
-interface DeleteWorkerInput {
-  script_name: string;
-}
-
-async function deleteWorker(apiToken: string, accountId: string, scriptName: string) {
+export async function deleteWorker(scriptName: string): Promise<string> {
+  const { apiToken, accountId } = getCredentials();
   const res = await httpCall(
     apiToken,
     "DELETE",
-    `/accounts/${accountId}/workers/scripts/${scriptName}`
+    `/accounts/${accountId}/workers/scripts/${encodeURIComponent(scriptName)}`,
   );
-  return JSON.stringify(res);
+  return JSON.stringify(res, null, 2);
 }
 
-interface SetWorkerSecretInput {
+export interface SetWorkerSecretInput {
   script_name: string;
   secret_name: string;
   secret_value: string;
 }
 
-async function setWorkerSecret(input: SetWorkerSecretInput) {
+export async function setWorkerSecret(input: SetWorkerSecretInput): Promise<string> {
   const { apiToken, accountId } = getCredentials();
   const res = await httpCall(
     apiToken,
     "PUT",
-    `/accounts/${accountId}/workers/scripts/${input.script_name}/secret`,
-    { name: input.secret_name, text: input.secret_value, type: "secret_text" }
+    `/accounts/${accountId}/workers/scripts/${encodeURIComponent(input.script_name)}/secrets`,
+    { name: input.secret_name, text: input.secret_value, type: "secret_text" },
   );
-  return JSON.stringify(res);
+  return JSON.stringify(res, null, 2);
 }
 
-interface ConfigureRouteInput {
+/* ------------------------------------------------------------------ */
+/* Routes & domaines                                                   */
+/* ------------------------------------------------------------------ */
+
+export interface ConfigureRouteInput {
   action: "create" | "delete" | "list";
   zone_id?: string;
   pattern?: string;
   script_name?: string;
   route_id?: string;
   custom_domain?: boolean;
-  workers_dev?: boolean;
-  script_name_for_custom_domain?: string;
 }
 
-async function configureRoute(input: ConfigureRouteInput) {
+export async function configureRoute(input: ConfigureRouteInput): Promise<string> {
   const { apiToken, accountId, zoneId } = getCredentials();
   const effectiveZoneId = input.zone_id ?? zoneId;
-  const zoneResponse = await httpCall(
-    apiToken,
-    "GET",
-    `/zones?account.id=${accountId}`
-  );
-  const zone = zoneResponse.result.find((z: { id: string }) => z.id === effectiveZoneId);
-  if (!zone) {
+
+  if (!effectiveZoneId) {
     throw new McpError(
       ErrorCode.InvalidRequest,
-      `Zone ${effectiveZoneId} not found under account ${accountId}.`
+      "zone_id requis (ou variable CLOUDFLARE_ZONE_ID). Lister les zones : cf-api GET /zones.",
     );
   }
+
   switch (input.action) {
     case "create": {
       if (input.custom_domain) {
@@ -281,121 +270,158 @@ async function configureRoute(input: ConfigureRouteInput) {
           hostname: input.pattern,
           service: input.script_name,
           environment: "production",
-          zone_name: zone.name,
         };
-        return JSON.stringify(await httpCall(
-          apiToken,
-          "PUT",
-          `/accounts/${accountId}/workers/domains`,
-          payload
-        ));
+        return JSON.stringify(
+          await httpCall(
+            apiToken,
+            "PUT",
+            `/accounts/${accountId}/workers/domains`,
+            payload,
+          ),
+          null,
+          2,
+        );
       }
-      const payload = {
-        pattern: input.pattern,
-        script: input.script_name,
-      };
-      return JSON.stringify(await httpCall(
-        apiToken,
-        "POST",
-        `/zones/${zone.id}/workers/routes`,
-        payload
-      ));
+      const payload = { pattern: input.pattern, script: input.script_name };
+      return JSON.stringify(
+        await httpCall(
+          apiToken,
+          "POST",
+          `/zones/${effectiveZoneId}/workers/routes`,
+          payload,
+        ),
+        null,
+        2,
+      );
     }
     case "delete": {
       if (input.custom_domain) {
         const domains = await httpCall(
           apiToken,
           "GET",
-          `/accounts/${accountId}/workers/domains?hostname=${input.pattern}`
+          `/accounts/${accountId}/workers/domains?hostname=${encodeURIComponent(input.pattern ?? "")}`,
         );
-        const domain = domains.result.find((d: { id: string }) => d.hostname === input.pattern);
+        const domain = (domains.result as any[] | undefined)?.find(
+          (d: { id: string; hostname: string }) => d.hostname === input.pattern,
+        );
         if (!domain) {
           throw new McpError(
             ErrorCode.InvalidRequest,
-            `Custom domain ${input.pattern} not found under account ${accountId}.`
+            `Custom domain ${input.pattern} not found under account ${accountId}.`,
           );
         }
-        return JSON.stringify(await httpCall(
+        return JSON.stringify(
+          await httpCall(
+            apiToken,
+            "DELETE",
+            `/accounts/${accountId}/workers/domains/${domain.id}`,
+          ),
+          null,
+          2,
+        );
+      }
+      if (!input.route_id) {
+        throw new McpError(ErrorCode.InvalidRequest, "route_id requis pour supprimer une route.");
+      }
+      return JSON.stringify(
+        await httpCall(
           apiToken,
           "DELETE",
-          `/accounts/${accountId}/workers/domains/${domain.id}`
-        ));
-      }
-      return JSON.stringify(await httpCall(
-        apiToken,
-        "DELETE",
-        `/zones/${zone.id}/workers/routes/${input.route_id}`
-      ));
+          `/zones/${effectiveZoneId}/workers/routes/${input.route_id}`,
+        ),
+        null,
+        2,
+      );
     }
     case "list": {
       if (input.custom_domain) {
-        return JSON.stringify(await httpCall(
-          apiToken,
-          "GET",
-          `/accounts/${accountId}/workers/domains?zone_name=${zone.name}`
-        ));
+        return JSON.stringify(
+          await httpCall(apiToken, "GET", `/accounts/${accountId}/workers/domains`),
+          null,
+          2,
+        );
       }
-      return JSON.stringify(await httpCall(
-        apiToken,
-        "GET",
-        `/zones/${zone.id}/workers/routes`
-      ));
+      return JSON.stringify(
+        await httpCall(apiToken, "GET", `/zones/${effectiveZoneId}/workers/routes`),
+        null,
+        2,
+      );
     }
     default: {
-      throw new McpError(ErrorCode.InvalidRequest, `Unknown action: ${input.action}`);
+      throw new McpError(ErrorCode.InvalidRequest, `Unknown action: ${String((input as any).action)}`);
     }
   }
 }
 
-interface TailWorkerLogsInput {
+/* ------------------------------------------------------------------ */
+/* Logs temps réel (API tail moderne : POST /tails → websocket_url)    */
+/* ------------------------------------------------------------------ */
+
+export interface TailWorkerLogsInput {
   script_name: string;
   duration_ms?: number;
 }
 
-interface LogEntry {
-  message: string;
-  level: string;
-  timestamp: number;
-  line?: number;
-}
-
-async function tailWorkerLogs(input: TailWorkerLogsInput) {
+export async function tailWorkerLogs(input: TailWorkerLogsInput): Promise<any[]> {
   const { apiToken, accountId } = getCredentials();
   const duration = input.duration_ms ?? 20000;
+
   const tailResponse = await httpCall(
     apiToken,
-    "PUT",
-    `/accounts/${accountId}/workers/scripts/${input.script_name}/tails`
+    "POST",
+    `/accounts/${accountId}/workers/scripts/${encodeURIComponent(input.script_name)}/tails`,
+    {},
   );
-  const tailId = tailResponse.result.id;
-  const logs: Array<LogEntry> = [];
+  const wsUrl: string | undefined = (tailResponse.result as any)?.websocket_url;
+  if (!wsUrl) {
+    throw new McpError(
+      ErrorCode.InternalError,
+      "Aucune URL websocket renvoyée par l'API tail.",
+    );
+  }
+
+  const logs: any[] = [];
   await new Promise<void>((resolve) => {
-    const ws = new WebSocket(`wss://tail.cloudflare.com/tail/${tailId}`, {
-      headers: authHeaders(apiToken),
-    });
+    const ws = new WebSocket(wsUrl); // WebSocket natif (Node 22+)
     const timeout = setTimeout(() => {
-      ws.close();
+      try {
+        ws.close();
+      } catch {
+        /* déjà fermé */
+      }
       resolve();
     }, duration);
-    ws.on("message", (data: Buffer) => {
+
+    ws.onmessage = (event: any) => {
       try {
-        const parsed = JSON.parse(data.toString()) as {
-          logs: LogEntry[];
-          exceptions: unknown[];
+        const parsed = JSON.parse(String(event.data)) as {
+          logs?: any[];
+          exceptions?: any[];
         };
-        logs.push(...parsed.logs);
+        if (Array.isArray(parsed.logs)) logs.push(...parsed.logs);
+        if (Array.isArray(parsed.exceptions)) {
+          logs.push(...parsed.exceptions.map((e) => ({ level: "exception", ...e })));
+        }
       } catch {
-        // ignore malformed messages
+        // message malformé : ignoré
       }
-    });
-    ws.on("close", () => {
+    };
+    ws.onclose = () => {
       clearTimeout(timeout);
       resolve();
-    });
-    ws.on("error", () => {
+    };
+    ws.onerror = () => {
       clearTimeout(timeout);
       resolve();
-    });
+    };
+    ws.onopen = () => {
+      try {
+        ws.send(JSON.stringify({ type: "ping" }));
+      } catch {
+        /* ignoré */
+      }
+    };
   });
+
   return logs;
 }
