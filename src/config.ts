@@ -1,9 +1,9 @@
 /*
  * config.ts — Identifiants Cloudflare PAR UTILISATEUR.
- * Chaque requête MCP porte le token de l'utilisateur qui l'a envoyée,
- * injecté par chat libre via customUserVars ({{CLOUDFLARE_API_TOKEN}},
- * {{CLOUDFLARE_ACCOUNT_ID}}). Rien n'est stocké ni partagé côté serveur :
- * un utilisateur ne peut jamais agir sur le compte Cloudflare d'un autre.
+ * L'utilisateur ne fournit QUE son token API (une seule valeur à copier-coller).
+ * L'ID de compte est déduit automatiquement du token via l'API Cloudflare
+ * (GET /accounts), et mis en cache en mémoire pour éviter un aller-retour
+ * réseau à chaque appel d'outil.
  */
 import type { Request } from "express";
 
@@ -13,21 +13,44 @@ export interface CfConfig {
   apiBase: string;
 }
 
-export function configFromRequest(req: Request): CfConfig {
+const CF_API_BASE = "https://api.cloudflare.com/client/v4";
+
+// Cache token -> accountId (mémoire, pas de secret stocké : juste l'ID de compte,
+// qui n'est pas sensible). Se vide au redémarrage, se re-remplit à la première requête.
+const accountIdCache = new Map<string, string>();
+
+export function tokenFromRequest(req: Request): string {
   const authHeader = req.headers["authorization"];
-  const apiToken =
-    typeof authHeader === "string" && authHeader.startsWith("Bearer ")
-      ? authHeader.slice(7).trim()
-      : "";
+  return typeof authHeader === "string" && authHeader.startsWith("Bearer ")
+    ? authHeader.slice(7).trim()
+    : "";
+}
 
-  const accountIdHeader = req.headers["x-cf-account-id"];
-  const accountId = typeof accountIdHeader === "string" ? accountIdHeader.trim() : "";
+/** Résout automatiquement le premier compte Cloudflare accessible avec ce token. */
+export async function resolveAccountId(apiToken: string): Promise<string | null> {
+  if (accountIdCache.has(apiToken)) {
+    return accountIdCache.get(apiToken)!;
+  }
+  try {
+    const res = await fetch(`${CF_API_BASE}/accounts`, {
+      headers: { Authorization: `Bearer ${apiToken}` },
+    });
+    const body = (await res.json()) as any;
+    const accountId: string | undefined = body?.result?.[0]?.id;
+    if (accountId) {
+      accountIdCache.set(apiToken, accountId);
+      return accountId;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
-  return {
-    apiToken,
-    accountId,
-    apiBase: "https://api.cloudflare.com/client/v4",
-  };
+export async function configFromRequest(req: Request): Promise<CfConfig> {
+  const apiToken = tokenFromRequest(req);
+  const accountId = apiToken ? (await resolveAccountId(apiToken)) ?? "" : "";
+  return { apiToken, accountId, apiBase: CF_API_BASE };
 }
 
 export function hasCredentials(cfg: CfConfig): boolean {
