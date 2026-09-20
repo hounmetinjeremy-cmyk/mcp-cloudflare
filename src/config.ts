@@ -1,9 +1,11 @@
 /*
- * config.ts — Authentification transparente.
- * Les identifiants Cloudflare sont lus UNE fois au démarrage et injectés
- * automatiquement dans chaque requête HTTP par cf-client.ts.
- * L'IA n'a donc AUCUN identifiant à fournir, JAMAIS.
+ * config.ts — Identifiants Cloudflare PAR UTILISATEUR.
+ * Chaque requête MCP porte le token de l'utilisateur qui l'a envoyée,
+ * injecté par chat libre via customUserVars ({{CLOUDFLARE_API_TOKEN}},
+ * {{CLOUDFLARE_ACCOUNT_ID}}). Rien n'est stocké ni partagé côté serveur :
+ * un utilisateur ne peut jamais agir sur le compte Cloudflare d'un autre.
  */
+import type { Request } from "express";
 
 export interface CfConfig {
   apiToken: string;
@@ -11,44 +13,23 @@ export interface CfConfig {
   apiBase: string;
 }
 
-export function loadConfig(): CfConfig {
-  const apiToken = process.env.CLOUDFLARE_API_TOKEN;
-  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+export function configFromRequest(req: Request): CfConfig {
+  const authHeader = req.headers["authorization"];
+  const apiToken =
+    typeof authHeader === "string" && authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7).trim()
+      : "";
 
-  if (!apiToken || !apiToken.trim()) {
-    console.error(
-      "CLOUDFLARE_API_TOKEN manquant — le serveur démarre en mode dégradé " +
-      "(les outils renverront des erreurs claires jusqu'à correction des variables d'environnement)."
-    );
-  }
-  if (!accountId || !accountId.trim()) {
-    console.error(
-      "CLOUDFLARE_ACCOUNT_ID manquant — les chemins /accounts/{account_id}/... échoueront."
-    );
-  }
+  const accountIdHeader = req.headers["x-cf-account-id"];
+  const accountId = typeof accountIdHeader === "string" ? accountIdHeader.trim() : "";
 
   return {
-    apiToken: (apiToken || "").trim(),
-    accountId: (accountId || "").trim(),
+    apiToken,
+    accountId,
     apiBase: "https://api.cloudflare.com/client/v4",
   };
 }
 
-/** Vérification automatique du jeton au démarrage (journal, non bloquant). */
-export async function verifyToken(cfg: CfConfig): Promise<void> {
-  try {
-    const res = await fetch(`${cfg.apiBase}/user/tokens/verify`, {
-      headers: { Authorization: `Bearer ${cfg.apiToken}` },
-    });
-    const body = (await res.json()) as any;
-    if (body?.success) {
-      const status = body.result?.status ?? "inconnu";
-      console.log(`Jeton Cloudflare vérifié automatiquement : status=${status}`);
-    } else {
-      const err = body?.errors?.[0]?.message ?? JSON.stringify(body);
-      console.error(`Vérification du jeton Cloudflare : ÉCHEC — ${err}`);
-    }
-  } catch (e: any) {
-    console.error(`Vérification du jeton Cloudflare impossible : ${e?.message ?? e}`);
-  }
+export function hasCredentials(cfg: CfConfig): boolean {
+  return Boolean(cfg.apiToken);
 }
