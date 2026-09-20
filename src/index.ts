@@ -1,14 +1,14 @@
 /*
  * index.ts — Point d'entrée : Express + MCP streamable HTTP (sans état).
- * Multi-utilisateurs : le token Cloudflare de CHAQUE requête vient de
- * l'en-tête envoyé par chat libre (propre à la personne connectée),
- * jamais d'une variable d'environnement partagée.
+ * Multi-utilisateurs : seul le token Cloudflare de la personne est requis.
+ * L'ID de compte est déduit automatiquement (config.ts) — rien d'autre à
+ * chercher ou copier pour l'utilisateur final.
  */
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { configFromRequest, hasCredentials } from "./config.js";
+import { configFromRequest, tokenFromRequest } from "./config.js";
 import type { CfConfig } from "./config.js";
 import { registerCfApi } from "./tools/cf-api.js";
 import { registerWorkersTools } from "./tools/workers.js";
@@ -18,7 +18,7 @@ import { registerLogsTools } from "./tools/logs.js";
 function createServer(cfg: CfConfig): McpServer {
   const server = new McpServer({
     name: "cloudflare-mcp-server",
-    version: "2.0.0",
+    version: "2.1.0",
   });
 
   registerCfApi(server, cfg);
@@ -32,24 +32,27 @@ function createServer(cfg: CfConfig): McpServer {
 const app = express();
 app.use(express.json());
 
-// L'autorisation, c'est le token Cloudflare lui-même : sans lui, aucun appel
-// à l'API Cloudflare ne peut réussir. On exige juste sa présence ici pour
-// renvoyer un message clair plutôt qu'une erreur Cloudflare opaque.
-function requireCredentials(req: Request, res: Response, next: NextFunction) {
-  const cfg = configFromRequest(req);
-  if (!hasCredentials(cfg)) {
+function requireToken(req: Request, res: Response, next: NextFunction) {
+  if (!tokenFromRequest(req)) {
     return res.status(401).json({
       error:
         "Token Cloudflare manquant. Dans chat libre, connecte ton compte Cloudflare " +
-        "via la fenêtre de configuration de l'outil (icône MCP) avant d'utiliser ce serveur.",
+        "via la fenêtre de configuration de l'outil (icône MCP) avant de l'utiliser.",
     });
   }
   next();
 }
 
-app.post("/mcp", requireCredentials, async (req, res) => {
+app.post("/mcp", requireToken, async (req, res) => {
   try {
-    const cfg = configFromRequest(req);
+    const cfg = await configFromRequest(req);
+    if (!cfg.accountId) {
+      return res.status(401).json({
+        error:
+          "Token Cloudflare invalide, ou aucun compte accessible avec ce token. " +
+          "Vérifie le token dans les réglages de chat libre.",
+      });
+    }
     const server = createServer(cfg);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // sans état : un serveur neuf par requête
